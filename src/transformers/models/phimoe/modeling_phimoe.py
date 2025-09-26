@@ -44,7 +44,6 @@ _EPS = 1e-12
 
 # toggles (env-driven so you can switch per run)
 PHIMOE_FREEZE_ROUTER = os.environ.get("PHIMOE_FREEZE_ROUTER", "0") == "1"
-MOE_AUX_LOSS_COEF = float(os.environ.get("MOE_AUX_LOSS_COEF", "0.0"))  # set at runtime
 
 if is_flash_attn_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -857,7 +856,7 @@ class PhimoeSparseMoeBlock(nn.Module):
 
         # 1) router + top-k
         router_logits = self.gate(hidden_states)                    # [T, E]
-        routing_weights, selected_experts = self.sparsemixer(
+        routing_weights, selected_experts = sparsemixer(
             router_logits,
             top_k=2,
             jitter_eps=self.router_jitter_noise,
@@ -1358,6 +1357,12 @@ class PhimoeForCausalLM(PhimoePreTrainedModel, GenerationMixin):
         self.num_experts_per_tok = config.num_experts_per_tok
         # Initialize weights and apply final processing
         self.post_init()
+        lb_coef = float(os.environ.get("MOE_AUX_LOSS_COEF", "0.0"))
+        self.router_aux_loss_coef = lb_coef
+        output_router_logits = os.environ.get("MOE_AUX_LOSS", None)
+        if output_router_logits is not None:
+            output_router_logits = bool(output_router_logits)
+        self.output_router_logits = output_router_logits
 
     # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM.set_decoder
     def set_decoder(self, decoder):
@@ -1413,14 +1418,20 @@ class PhimoeForCausalLM(PhimoePreTrainedModel, GenerationMixin):
                 f"If you are not using the generate method, you may encounter nonsensical outputs after the {self.config.original_max_position_embeddings}th token, as the KV cache needs to be recomputed."
             )
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_router_logits = (
-            output_router_logits if output_router_logits is not None else self.config.output_router_logits
-        )
+        
+        if getattr(self, "output_router_logits", None) is not None:
+            output_router_logits = self.output_router_logits
+            if self.model.training == False:
+                output_router_logits = False
+        else:
+            output_router_logits = (
+                output_router_logits if output_router_logits is not None else self.config.output_router_logits
+            )
 
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-
+        
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -1445,6 +1456,7 @@ class PhimoeForCausalLM(PhimoePreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits, labels, self.vocab_size, **kwargs)
 
         aux_loss = None
+        # breakpoint()
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
                 outputs.router_logits,
@@ -1452,6 +1464,7 @@ class PhimoeForCausalLM(PhimoePreTrainedModel, GenerationMixin):
                 self.num_experts_per_tok,
                 attention_mask,
             )
+            # breakpoint()
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
@@ -1506,7 +1519,30 @@ class PhimoeForCausalLM(PhimoePreTrainedModel, GenerationMixin):
         return model_inputs
 
 
+# def phimoe_sum_load_balance_loss(model: torch.nn.Module) -> torch.Tensor:
+#     """
+#     Sum per-layer _lb_loss stored by PhiMoESparseMoeBlock during forward.
+#     Returns a scalar tensor on the correct device.
+#     """
+#     device, dtype = None, None
+#     total = None
+#     for p in model.parameters():
+#         device, dtype = p.device, p.dtype
+#         break
+#     for m in model.modules():
+#         if isinstance(m, PhiMoESparseMoeBlock) and hasattr(m, "_lb_loss"):
+#             total = m._lb_loss if total is None else (total + m._lb_loss)
+#     if total is None:
+#         total = torch.zeros((), device=device, dtype=dtype)
+#     return total
+
+
 class PhimoeForSequenceClassification(GenericForSequenceClassification, PhimoePreTrainedModel): ...
+
+
+
+
+
 
 
 __all__ = [
@@ -1515,21 +1551,3 @@ __all__ = [
     "PhimoeForCausalLM",
     "PhimoeForSequenceClassification",
 ]
-
-
-def phimoe_sum_load_balance_loss(model: torch.nn.Module) -> torch.Tensor:
-    """
-    Sum per-layer _lb_loss stored by PhiMoESparseMoeBlock during forward.
-    Returns a scalar tensor on the correct device.
-    """
-    device, dtype = None, None
-    total = None
-    for p in model.parameters():
-        device, dtype = p.device, p.dtype
-        break
-    for m in model.modules():
-        if isinstance(m, PhiMoESparseMoeBlock) and hasattr(m, "_lb_loss"):
-            total = m._lb_loss if total is None else (total + m._lb_loss)
-    if total is None:
-        total = torch.zeros((), device=device, dtype=dtype)
-    return total
