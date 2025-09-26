@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """PyTorch Phimoe model."""
+import torch.nn.functional as F
 
 import math
 from typing import Optional, Union
@@ -37,6 +38,13 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 from .configuration_phimoe import PhimoeConfig
 
+import os
+import torch
+_EPS = 1e-12
+
+# toggles (env-driven so you can switch per run)
+PHIMOE_FREEZE_ROUTER = os.environ.get("PHIMOE_FREEZE_ROUTER", "0") == "1"
+MOE_AUX_LOSS_COEF = float(os.environ.get("MOE_AUX_LOSS_COEF", "0.0"))  # set at runtime
 
 if is_flash_attn_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -746,14 +754,157 @@ class PhimoeSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-
+        if PHIMOE_FREEZE_ROUTER:
+            for p in self.gate.parameters():
+                p.requires_grad = False
+            # verify 
+            print("INFO: PhimoeSparseMoeBlock router parameters requires_grad:")
+            for n, p in self.gate.named_parameters():
+                print(f"PhimoeSparseMoeBlock router {n} requires_grad: {p.requires_grad}")
+                
+                
         self.experts = nn.ModuleList([PhimoeBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
         # Jitter parameters
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        
+
+    # def forward(self, hidden_states: torch.Tensor):
+    #     batch_size, sequence_length, hidden_dim = hidden_states.shape
+    #     if self.training and self.input_jitter_noise > 0:
+    #         hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
+    #             1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise
+    #         )
+
+    #     hs2d = hidden_states.view(-1, hidden_dim)                        # (N, H), N= B*S
+    #     router_logits = self.gate(hs2d)
+
+    #     # sparsemixer returns (N, top_k) weights and expert indices
+    #     routing_weights, selected_experts = sparsemixer(
+    #         router_logits,
+    #         jitter_eps=self.router_jitter_noise,
+    #         training=self.training,
+    #     )
+
+    #     # Build per-token per-expert weights w \in R^{N x E} with zeros where not selected
+    #     N = hs2d.size(0)
+    #     w = hs2d.new_zeros(N, self.num_experts, dtype=hs2d.dtype)        # (N, E)
+    #     # scatter_add along expert axis: put each token’s k weights into their chosen experts
+    #     w.scatter_add_(1, selected_experts, routing_weights.to(hs2d.dtype))
+
+    #     # Always run each expert on ALL tokens, then mask by w[:, e]
+    #     out2d = hs2d.new_zeros(N, hidden_dim)
+    #     for e in range(self.num_experts):
+    #         y_e = self.experts[e](hs2d)                                  # (N, H)
+    #         out2d.add_(y_e * w[:, e:e+1])                                # broadcast mask (N,1)
+
+    #     return out2d.view(batch_size, sequence_length, hidden_dim), router_logits
+    
+    
+    # def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    #     """ debug: first expert only """
+    #     batch_size, sequence_length, hidden_dim = hidden_states.shape
+    #     if self.training and self.input_jitter_noise > 0:
+    #         hidden_states *= torch.empty_like(hidden_states).uniform_(
+    #             1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise
+    #         )
+    #     # Flatten to 2‑D for the gate
+    #     hidden_states_2d = hidden_states.view(-1, hidden_dim)
+    #     # Still compute gating so router_logits has the correct shape
+    #     router_logits = self.gate(hidden_states_2d)
+    #     routing_weights, selected_experts = sparsemixer(
+    #         router_logits,
+    #         jitter_eps=self.router_jitter_noise,
+    #         training=self.training,
+    #     )
+
+    #     # Initialise the output buffer
+    #     final_hidden_states = torch.zeros(
+    #         (batch_size * sequence_length, hidden_dim),
+    #         dtype=hidden_states.dtype,
+    #         device=hidden_states.device,
+    #     )
+
+    #     # For debugging: force the selection to the first expert (index 0)
+    #     expert_idx = 0
+    #     expert_layer = self.experts[expert_idx]
+
+    #     # All tokens go to the first expert, so the index is just the full range
+    #     token_indices = torch.arange(batch_size * sequence_length, device=hidden_states.device)
+    #     current_state = hidden_states_2d[token_indices]
+
+    #     # Only keep the routing weight for the first expert
+    #     # routing_weights has shape (N, top_k); the weight for expert 0 is in routing_weights[..., 0]
+    #     # If sparsemixer returns top-1 and top-2, we just use the first column
+    #     first_expert_weight = routing_weights[token_indices, 0].unsqueeze(-1)
+
+    #     current_hidden_states = expert_layer(current_state) * first_expert_weight.to(current_state.dtype)
+    #     final_hidden_states.index_add_(0, token_indices, current_hidden_states)
+
+    #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    #     return final_hidden_states, router_logits
+
+    
+    def forward(self, hidden_states: torch.Tensor):
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        if self.training and self.input_jitter_noise > 0:
+            hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
+                1.0 - self.input_jitter_noise, 1.0 + self.input_jitter_noise
+            )
+        hidden_states = hidden_states.view(-1, hidden_dim)          # [T, H]; T=B*S
+
+        # 1) router + top-k
+        router_logits = self.gate(hidden_states)                    # [T, E]
+        routing_weights, selected_experts = self.sparsemixer(
+            router_logits,
+            top_k=2,
+            jitter_eps=self.router_jitter_noise,
+            training=self.training,
+        )                                                           # weights: [T,2], idx: [T,2]
+
+        # 2) load-balance stats (baseline A)
+        probs = torch.softmax(router_logits, dim=-1)                # [T, E]
+        importance = probs.sum(dim=0)                               # [E]
+        one_hot = torch.nn.functional.one_hot(
+            selected_experts, num_classes=self.num_experts
+        )                                                           # [T,2,E]
+        expert_mask = one_hot.permute(2, 1, 0).contiguous()         # [E,2,T]
+        load = expert_mask.sum(dim=(1, 2)).to(importance.dtype)     # [E]
+
+        imp_norm = importance / (importance.sum() + _EPS)
+        load_norm = load / (load.sum() + _EPS)
+        lb_loss_layer = (imp_norm * load_norm).sum() * float(self.num_experts)
+
+        # stash per-layer LB loss (no coef here; coef applied when summed)
+        self._lb_loss = lb_loss_layer
+
+        # 3) always execute all experts (FSDP-safe)
+        final_hidden_states = torch.zeros(
+            (hidden_states.size(0), hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        for expert_idx in range(self.num_experts):
+            expert_layer = self.experts[expert_idx]
+            idx, top_x = torch.where(expert_mask[expert_idx])       # idx∈{0,1}; top_x token ids
+
+            if top_x.numel() == 0:
+                # touch expert on empty input so hooks run and FSDP stays in sync
+                _ = expert_layer(hidden_states.new_zeros((0, hidden_dim)))
+                continue
+
+            top_x_list, idx_list = top_x.tolist(), idx.tolist()
+            current = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            out = expert_layer(current) * routing_weights[top_x_list, idx_list, None]
+            final_hidden_states.index_add_(0, top_x, out.to(hidden_states.dtype))
+
+        final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
+        return final_hidden_states, router_logits
+    
+    def forward_back(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
@@ -762,13 +913,13 @@ class PhimoeSparseMoeBlock(nn.Module):
             )
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
-
+    
         routing_weights, selected_experts = sparsemixer(
             router_logits,
             jitter_eps=self.router_jitter_noise,
             training=self.training,
         )
-
+        # breakpoint()
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
@@ -776,15 +927,16 @@ class PhimoeSparseMoeBlock(nn.Module):
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
+        
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
-
+            
             if top_x.shape[0] == 0:
+                _ = expert_layer(hidden_states.new_zeros((0, hidden_dim)))
                 continue
-
+                
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
@@ -1363,3 +1515,21 @@ __all__ = [
     "PhimoeForCausalLM",
     "PhimoeForSequenceClassification",
 ]
+
+
+def phimoe_sum_load_balance_loss(model: torch.nn.Module) -> torch.Tensor:
+    """
+    Sum per-layer _lb_loss stored by PhiMoESparseMoeBlock during forward.
+    Returns a scalar tensor on the correct device.
+    """
+    device, dtype = None, None
+    total = None
+    for p in model.parameters():
+        device, dtype = p.device, p.dtype
+        break
+    for m in model.modules():
+        if isinstance(m, PhiMoESparseMoeBlock) and hasattr(m, "_lb_loss"):
+            total = m._lb_loss if total is None else (total + m._lb_loss)
+    if total is None:
+        total = torch.zeros((), device=device, dtype=dtype)
+    return total
