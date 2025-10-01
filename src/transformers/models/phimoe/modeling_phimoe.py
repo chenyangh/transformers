@@ -844,9 +844,8 @@ class PhimoeSparseMoeBlock(nn.Module):
 
     #     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
     #     return final_hidden_states, router_logits
-
     
-    def forward(self, hidden_states: torch.Tensor):
+    def forward_with_lb_loss(self, hidden_states: torch.Tensor):
         batch_size, seq_len, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
             hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(
@@ -903,7 +902,7 @@ class PhimoeSparseMoeBlock(nn.Module):
         final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
         return final_hidden_states, router_logits
     
-    def forward_back(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         if self.training and self.input_jitter_noise > 0:
@@ -912,12 +911,17 @@ class PhimoeSparseMoeBlock(nn.Module):
             )
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate(hidden_states)
-    
-        routing_weights, selected_experts = sparsemixer(
-            router_logits,
-            jitter_eps=self.router_jitter_noise,
-            training=self.training,
-        )
+        
+        if True:
+            routing_weights, selected_experts = sparsemixer(
+                router_logits,
+                jitter_eps=self.router_jitter_noise,
+                training=self.training,
+            )
+        else:
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
         # breakpoint()
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
